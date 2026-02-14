@@ -1,0 +1,87 @@
+name: Build IPA
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build maciOS IPA
+    runs-on: macos-latest
+    env:
+      TEAM_ID: ${{ secrets.TEAM_ID }}
+      EXPORT_METHOD: ${{ secrets.EXPORT_METHOD }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install Fastlane (optional helper)
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+      - name: Install fastlane gem
+        run: gem install fastlane -N || true
+
+      - name: Prepare keychain and import certificate
+        env:
+          CERTIFICATE_P12: ${{ secrets.CERTIFICATE_P12 }}
+          CERT_PASSWORD: ${{ secrets.CERT_PASSWORD }}
+        run: |
+          set -e
+          echo "$CERTIFICATE_P12" | base64 --decode > cert.p12
+          security create-keychain -p actions build.keychain
+          security import cert.p12 -k ~/Library/Keychains/build.keychain -P "$CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security list-keychains -s ~/Library/Keychains/build.keychain
+          security default-keychain -s ~/Library/Keychains/build.keychain
+          security unlock-keychain -p actions ~/Library/Keychains/build.keychain
+          security set-key-partition-list -S apple-tool:,apple: -s -k actions ~/Library/Keychains/build.keychain || true
+
+      - name: Install provisioning profile
+        env:
+          MOBILEPROVISION: ${{ secrets.MOBILEPROVISION }}
+        run: |
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          echo "$MOBILEPROVISION" | base64 --decode > profile.mobileprovision
+          UUID=$(security cms -D -i profile.mobileprovision 2>/dev/null | /usr/bin/xmllint --xpath 'string(//plist/dict/key[. = "UUID"]/following-sibling::string[1])' - 2>/dev/null || true)
+          if [ -n "$UUID" ]; then
+            cp profile.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/$UUID.mobileprovision
+          else
+            cp profile.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/profile.mobileprovision
+          fi
+
+      - name: Build archive
+        run: |
+          set -e
+          mkdir -p build
+          xcodebuild -project maciOS.xcodeproj -scheme maciOS -configuration Release -archivePath $PWD/build/maciOS.xcarchive archive
+
+      - name: Export IPA
+        run: |
+          set -e
+          mkdir -p build/ipa
+          cat > exportOptions.plist <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>$EXPORT_METHOD</string>
+            <key>teamID</key>
+            <string>$TEAM_ID</string>
+            <key>compileBitcode</key>
+            <false/>
+            <key>signingStyle</key>
+            <string>manual</string>
+          </dict>
+          </plist>
+          EOF
+          xcodebuild -exportArchive -archivePath $PWD/build/maciOS.xcarchive -exportOptionsPlist exportOptions.plist -exportPath $PWD/build/ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: maciOS-ipa
+          path: build/ipa
